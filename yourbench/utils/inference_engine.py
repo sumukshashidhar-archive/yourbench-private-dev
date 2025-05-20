@@ -159,11 +159,21 @@ def _write_aggregate_log():
 
         _ensure_logs_dir()
         logger.info(f"Writing aggregate cost log to {_aggregate_log_file}")
-        with open(_aggregate_log_file, "w", newline="", encoding="utf-8") as f:
+        is_new_file = not os.path.exists(_aggregate_log_file)
+        mode = "a" if not is_new_file else "w"
+        with open(_aggregate_log_file, mode, newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["model_name", "total_input_tokens", "total_output_tokens", "total_calls"])
+            if is_new_file:
+                writer.writerow([
+                    "timestamp",
+                    "model_name",
+                    "total_input_tokens",
+                    "total_output_tokens",
+                    "total_calls",
+                ])
+            timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
             for model_name, data in sorted(_cost_data.items()):
-                writer.writerow([model_name, data["input_tokens"], data["output_tokens"], data["calls"]])
+                writer.writerow([timestamp, model_name, data["input_tokens"], data["output_tokens"], data["calls"]])
         logger.success(f"Aggregate cost log successfully written to {_aggregate_log_file}")
     except Exception as e:
         # Use print here as logger might be shutting down during atexit
