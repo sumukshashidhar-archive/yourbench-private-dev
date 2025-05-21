@@ -1,37 +1,42 @@
+from __future__ import annotations
 import re
 import json
 import random
 import hashlib
-from typing import Any
+from typing import Any, Mapping, Iterable
+from dataclasses import dataclass
 
 from loguru import logger
 
 
-def extract_content_from_xml_tags(full_content, xml_tag):
-    # This function extracts the content between the XML tags
-    # It uses regex to find the content and includes error handling
+@dataclass(slots=True)
+class _MCQ:
+    choices: list[str]
+    answer: str
 
-    # Define the regex patterns to match the content
-    pattern_with_closing_tag = f"<{xml_tag}>(.*?)</{xml_tag}>"
-    pattern_without_closing_tag = f"<{xml_tag}>(.*)"
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> "_MCQ":
+        return cls(
+            choices=[str(c) for c in data.get("choices", [])],
+            answer=str(data.get("answer", "")).strip().upper(),
+        )
 
+    def to_dict(self) -> dict[str, Any]:
+        return {"choices": self.choices, "answer": self.answer}
+
+
+def extract_content_from_xml_tags(full_content: str, xml_tag: str) -> str:
+    """Return text inside ``<xml_tag>...</xml_tag>`` (best effort)."""
     try:
-        # First, try to find matches with both opening and closing tags
-        matches_with_closing = re.findall(pattern_with_closing_tag, full_content, re.DOTALL)
-        if matches_with_closing:
-            return matches_with_closing[0].strip()
-
-        # If no matches found, try to find content with only opening tag
-        matches_without_closing = re.findall(pattern_without_closing_tag, full_content, re.DOTALL)
-        if matches_without_closing:
-            return matches_without_closing[0].strip()
-
-        # If still no matches found, return an empty string
-        return ""
-
-    except Exception as extraction_error:
-        logger.error(f"Error extracting content from XML tags: {extraction_error}")
-        return ""
+        closing = re.search(rf"<{xml_tag}>(.*?)</{xml_tag}>", full_content, re.DOTALL)
+        if closing:
+            return closing.group(1).strip()
+        opening = re.search(rf"<{xml_tag}>(.*)", full_content, re.DOTALL)
+        if opening:
+            return opening.group(1).strip()
+    except Exception as err:
+        logger.error(f"extract_content_from_xml_tags failed for {xml_tag}: {err}")
+    return ""
 
 
 def parse_qa_pairs_from_response(raw_response: str) -> list[dict[str, Any]]:
@@ -58,97 +63,70 @@ def parse_qa_pairs_from_response(raw_response: str) -> list[dict[str, Any]]:
         question-answer information. If no valid parse is found,
         an empty list is returned.
     """
-    if not raw_response or not isinstance(raw_response, str):
+    if not isinstance(raw_response, str) or not raw_response.strip():
         return []
 
-    # 1) Check for <output_json>...</output_json>
-    extracted_json_str = _extract_tag_content(raw_response, "output_json")
-    if extracted_json_str.strip():
-        possible_parsed = _attempt_json_parse(_maybe_strip_triple_backticks(extracted_json_str))
-        if isinstance(possible_parsed, list):
-            return possible_parsed
+    candidates: list[str] = []
+    tag_block = _extract_tag_content(raw_response, "output_json")
+    if tag_block:
+        candidates.append(_maybe_strip_triple_backticks(tag_block))
+    fence = re.search(r"```json\s*([\s\S]*?)\s*```", raw_response)
+    if fence:
+        candidates.append(fence.group(1).strip())
+    candidates.extend(_best_effort_json_extract(raw_response))
 
-    # 2) Check for ```json fenced code block
-    fence_pattern = r"```json\s*([\s\S]*?)\s*```"
-    fence_match = re.search(fence_pattern, raw_response)
-    if fence_match:
-        possible_parsed = _attempt_json_parse(fence_match.group(1).strip())
-        if isinstance(possible_parsed, list):
-            return possible_parsed
-
-    # 3) Best-effort bracket-based extraction
-    bracket_candidates = _best_effort_json_extract(raw_response)
-    for candidate in bracket_candidates:
-        possible_parsed = _attempt_json_parse(candidate)
-        if isinstance(possible_parsed, list):
-            return possible_parsed
-
-    # If no valid parse was found, return empty.
-    return []
+    return _parse_first_json_list(candidates)
 
 
 def _extract_tag_content(text: str, tag: str) -> str:
-    """
-    Extract text enclosed in <tag>...</tag> from the given string.
-    Returns an empty string if the tag is not found.
-    """
+    """Return inner text of ``<tag>`` if present."""
     try:
-        pattern = rf"<{tag}\s*>([\s\S]*?)</{tag}>"
-        match = re.search(pattern, text)
-        if match:
-            return match.group(1).strip()
-    except Exception as e:
-        logger.debug(f"Error extracting tag content for '{tag}': {e}")
-    return ""
+        match = re.search(rf"<{tag}\s*>([\s\S]*?)</{tag}>", text)
+        return match.group(1).strip() if match else ""
+    except Exception as err:
+        logger.debug(f"_extract_tag_content error: {err}")
+        return ""
 
 
 def _maybe_strip_triple_backticks(text_in: str) -> str:
-    """
-    Removes triple backticks (``` or ```json) from the beginning
-    and end of a string, if present.
-    """
-    if not text_in or not isinstance(text_in, str):
+    """Remove surrounding ``` or ```json fences, if any."""
+    if not isinstance(text_in, str):
         return ""
     try:
-        pattern = r"^\s*```(?:json)?\s*([\s\S]*?)\s*```$"
-        match = re.match(pattern, text_in)
-        if match:
-            return match.group(1)
-    except Exception as e:
-        logger.debug(f"Error stripping backticks: {e}")
-    return text_in
+        match = re.match(r"^\s*```(?:json)?\s*([\s\S]*?)\s*```$", text_in)
+        return match.group(1) if match else text_in
+    except Exception as err:
+        logger.debug(f"_maybe_strip_triple_backticks error: {err}")
+        return text_in
 
 
 def _best_effort_json_extract(full_text: str) -> list[str]:
-    """
-    Collect bracket-delimited substrings that might be valid JSON.
-    Returns a list of candidates (which may be empty).
-    """
-    if not full_text or not isinstance(full_text, str):
+    """Return bracket-delimited substrings that might be JSON."""
+    if not isinstance(full_text, str):
         return []
-    candidates = []
     try:
         pattern = r"([\[{].*?[\]}])"
-        matches = re.findall(pattern, full_text, flags=re.DOTALL)
-        for match_text in matches:
-            if (match_text.startswith("[") and match_text.endswith("]")) or (
-                match_text.startswith("{") and match_text.endswith("}")
-            ):
-                candidates.append(match_text.strip())
-    except Exception as e:
-        logger.debug(f"Error in best-effort JSON extraction: {e}")
-    return candidates
+        return [m.strip() for m in re.findall(pattern, full_text, re.DOTALL)]
+    except Exception as err:
+        logger.debug(f"_best_effort_json_extract error: {err}")
+        return []
 
 
 def _attempt_json_parse(json_str: str) -> Any:
-    """
-    Attempt to parse a JSON string. Return parsed object if success,
-    or None if parsing fails.
-    """
+    """Return parsed JSON or ``None`` if invalid."""
     try:
         return json.loads(json_str)
-    except Exception:
+    except Exception as err:
+        logger.debug(f"JSON parse error: {err}")
         return None
+
+
+def _parse_first_json_list(candidates: Iterable[str]) -> list[dict[str, Any]]:
+    for cand in candidates:
+        parsed = _attempt_json_parse(cand)
+        if isinstance(parsed, list):
+            return parsed
+    return []
 
 
 def shuffle_mcq(question_dict: dict) -> dict:
@@ -156,33 +134,23 @@ def shuffle_mcq(question_dict: dict) -> dict:
     Shuffles MCQ choices randomly and ensures the correct answer is placed under a random label A-D.
     The final choices are labeled A., B., C., D. in order, but the correct answer may be under any of them.
     """
-    labeled_choices = question_dict.get("choices", [])
-    answer_letter = question_dict.get("answer", "").strip().upper()
+    mcq = _MCQ.from_mapping(question_dict)
 
-    if not labeled_choices or not answer_letter:
+    if not mcq.choices or not mcq.answer:
         return question_dict
 
-    # Extract raw text (removing A., B., etc.)
-    raw_choices = [choice[3:].strip() for choice in labeled_choices]
-    answer_index = ord(answer_letter) - ord("A")
-    answer_choice_text = raw_choices[answer_index]
+    raw_choices = [c[3:].strip() for c in mcq.choices]
+    try:
+        answer_text = raw_choices[ord(mcq.answer) - ord("A")]
+    except Exception:
+        return question_dict
 
-    # Shuffle the raw choices randomly
-    seed_input = repr((raw_choices, answer_letter))
-    seed = int(hashlib.sha256(seed_input.encode()).hexdigest(), 16)
-
+    seed = int(hashlib.sha256(repr((raw_choices, mcq.answer)).encode()).hexdigest(), 16)
     rng = random.Random(seed)
     rng.shuffle(raw_choices)
 
-    # Find new index of the correct choice
-    new_correct_index = raw_choices.index(answer_choice_text)
-    new_answer_letter = chr(ord("A") + new_correct_index)
-
-    # Re-label as A., B., C., D.
-    labeled_shuffled = [f"({chr(ord('A') + i)}) {text}" for i, text in enumerate(raw_choices)]
-
-    # Update the question dict
-    question_dict["choices"] = labeled_shuffled
-    question_dict["answer"] = new_answer_letter
-
+    new_letter = chr(ord("A") + raw_choices.index(answer_text))
+    mcq.choices = [f"({chr(ord('A') + i)}) {t}" for i, t in enumerate(raw_choices)]
+    mcq.answer = new_letter
+    question_dict.update(mcq.to_dict())
     return question_dict
